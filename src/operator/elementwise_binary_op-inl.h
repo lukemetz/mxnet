@@ -149,6 +149,7 @@ class ElementWiseBinaryOp : public Operator {
         // rhs cannot do inplace
         CHECK_NE(req[elembinary::kRhs], kWriteInplace);
         Assign(rhs_grad, req[elembinary::kRhs],
+               //F<mshadow_op::log>(base_data) * m_out_data * m_out_grad);
                F<mshadow_op::log>(base_data) * m_out_data * m_out_grad);
         Assign(lhs_grad, req[elembinary::kLhs],
                exponent_data * F<mshadow_op::power>(base_data, exponent_data - 1) * m_out_grad);

@@ -250,21 +250,132 @@ def test_scalarop():
     exe_test.backward(out_grad)
     assert reldiff(arr_grad.asnumpy(), npout_grad) < 1e-6
 
+class NumericGrad(object):
+    """ Class based on Theano's `theano.gradient.numeric_grad` [1]
+    Calculates a numeric gradient via finite difference method.
+
+    Parameters:
+    -----------
+    executor: `mxnet.executor.Executor`
+        exectutor that computes the forward pass
+
+    location: list np.ndarray
+        location in which to compute gradient. list should be the same size
+        as executor.arg_arrays
+
+    References
+    ---------
+    ..[1] https://github.com/Theano/Theano/blob/master/theano/gradient.py
+    """
+    def __init__(self, executor, location, eps=1e-4):
+        args = executor.arg_arrays
+        for a, l in zip(args, location):
+            a[:] = np.asarray(l)
+        approx_grads = [np.zeros_like(l) for l in location]
+
+        executor.forward()
+        f_x = executor.outputs[0].asnumpy()
+
+        x_copy = [np.copy(x) for x in location]
+        for ap_grad, loc, reset in zip(approx_grads, location, x_copy):
+            for i in range(np.prod(loc.shape)):
+                # inplace update of memory
+                loc.ravel()[i] += eps
+
+                # set initial states. Need to set all due to inplace operations
+                for inp, val in zip(args, location):
+                    inp[:] = val
+                executor.forward()
+                f_eps = executor.outputs[0].asnumpy()
+                ap_grad.ravel()[i] = (f_eps - f_x) / eps
+                loc.ravel()[i] = reset.ravel()[i]
+
+        self.f_x = f_x
+        self.approx_grads = approx_grads
+        print self.approx_grads, "approx grad"
+
+    def rel_error_to(self, grad):
+        abs_error = [np.abs(a - b) for a, b in zip(grad, self.approx_grads)]
+        rel_error = [e / np.maximum(np.abs(a) + np.abs(b), 1e-8) for (e, a, b)
+                     in zip(abs_error, grad, self.approx_grads)]
+        return rel_error
+
+def verify_op(sym, location, target, n_tests):
+    """ Class based on Theano's `theano.gradient.numeric_grad` [1]
+
+    References
+    ---------
+    ..[1] https://github.com/Theano/Theano/blob/master/theano/gradient.py
+    """
+
+
+
+    # random_projection should not have elements too small,
+    # otherwise too much precision is lost in numerical gradient
+    def random_projection(shape):
+        plain = np.rng.rand(*shape) + 0.5
+        return plain
+
+    sym = mx.sym.SumAll(sym)
+    out = mx.sym.Loss(sym)
+    args = out.list_arguments()
+
+    kwargs = {a:loc.shape for a,loc in zip(args, location)}
+    print kwargs
+    #executor = out.simple_bind(mx.cpu(), grad_req="write", **kwargs)
+    #executor = out.bind(mx.cpu(), grad_req="write", grad_arrays=
+    arr_data = [mx.nd.array(l) for l in location]
+    arr_grad = [mx.nd.empty(l.shape) for l in location]
+
+    executor = out.bind(mx.cpu(), args=arr_data, args_grad=arr_grad)
+
+    inps = executor.arg_arrays
+    if len(inps) != len(location):
+        raise ValueError("Executor arg_arrays and and location len do not match."
+                         "Got %d inputs and %d locations"%(len(inps), len(location))
+        )
+    for inp, source in zip(location, executor.arg_arrays):
+        source[:] = inp
+
+    for g in executor.grad_arrays:
+        if g:
+            g[:] = 0
+
+    assert len(executor.outputs) == 1
+
+    executor.forward()
+    executor.backward()
+    symbolic_grad = [g.asnumpy() for g in executor.grad_arrays]
+
+    print location[0], "location"
+    print symbolic_grad, "computed grad symbolic"
+    error = NumericGrad(executor, location).rel_error_to(symbolic_grad)
+    for e in error:
+        assert_allclose(e, np.zeros_like(e), atol=1e-2)
+
+
 def test_scalar_pow():
     data = mx.symbol.Variable('data')
+    shape = (1, 1)
+    data_tmp = np.ones(shape)
+    test = data ** 2
+    verify_op(test, [data_tmp], [data_tmp], n_tests=2)
+
+def check_elementwise_op(sym_forward, np_forward):
+    data = mx.symbol.Variable('data')
+    test = sym_forward(data)
+
     shape = (3, 4)
     data_tmp = np.ones(shape)
-    data_tmp[:]=5
+    data_tmp[:] = 5
     arr_data = mx.nd.array(data_tmp)
     arr_grad = mx.nd.empty(shape)
-    arr_grad[:]=3
-
-    test = data**4
+    arr_grad[:] = 3
 
     exe_test = test.bind(mx.cpu(), args=[arr_data], args_grad=[arr_grad])
     exe_test.forward()
     out = exe_test.outputs[0].asnumpy()
-    npout = data_tmp**4
+    npout = forward(data_tmp)
 
     assert_allclose(out, npout)
 
@@ -280,68 +391,38 @@ def test_scalar_pow():
 
 
 def test_symbol_pow():
-    shape = (3, 4)
+    shape = (1, 1)
 
     data = mx.symbol.Variable('data')
-    data_tmp = np.ones(shape)
-    data_tmp[:]=5
+    data_tmp = np.ones(shape)*2
 
     exp = mx.symbol.Variable('exp')
-    exp_tmp = np.ones(shape)
-    exp_tmp[:]=4
-
-    arr_data = mx.nd.array(data_tmp)
-    arr_exp = mx.nd.array(exp_tmp)
-    data_grad = mx.nd.empty(shape)
-    data_grad[:]=3
-    exp_grad = mx.nd.empty(shape)
-    exp_grad[:]=5
+    exp_tmp = np.ones(shape)*3
 
     test = data**exp
 
-    exe_test = test.bind(mx.cpu(), args=[arr_data, arr_exp], args_grad=[data_grad, exp_grad])
-    exe_test.forward()
-    out = exe_test.outputs[0].asnumpy()
-    npout = data_tmp**4
+    verify_op(test, [data_tmp, exp_tmp], [data_tmp**exp_tmp], 2)
 
-    assert_allclose(out, npout)
+test_symbol_pow()
+import ipdb; ipdb.set_trace()
 
-    out_grad = mx.nd.empty(shape)
-    out_grad[:] = 2;
-    npout_grad = out_grad.asnumpy()
-
-    exe_test.backward(out_grad)
-    # check the base
-    grad = data_grad.asnumpy()
-    npgrad = data_tmp**3 * 4 * 2
-    assert_allclose(grad, npgrad)
-
-    # check the exponent
-    grad = exp_grad.asnumpy()
-    npgrad = np.log(5) * 5**4 * 2
-    assert_allclose(grad, npgrad)
 
 def test_pow_fn():
     shape = (3, 4)
     exp = mx.symbol.Variable("exp")
     y = mx.sym.pow(2, exp)
-    exe_test = y.simple_bind(mx.cpu(), exp=shape)
+    x = np.ones(shape)*3
+    verify_op(y, [x], [2**x], n_tests=2)
+#test_pow_fn()
 
-    exe_test.arg_arrays[0][:] = 3
+def test_sum():
+    shape = (3, 4)
+    x = mx.symbol.Variable("data")
 
-    exe_test.forward()
+    y = mx.sym.SumAll(x)
+    verify_op(y, [np.ones(shape)], [np.ones((1,))*np.prod(shape)], n_tests=2)
 
-    out = exe_test.outputs[0].asnumpy()
-    assert_allclose(out, np.ones(shape)*8)
-
-    out_grad = mx.nd.empty(shape)
-    out_grad[:] = 2;
-
-    exe_test.backward(out_grad)
-    grad = exe_test.grad_arrays[0].asnumpy()
-    npgrad = np.log(2) * (2**3) * np.ones(shape) * 2
-
-    assert_allclose(grad, npgrad)
+#test_sum()
 
 if __name__ == '__main__':
     test_elementwise_sum()
